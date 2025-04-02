@@ -7,14 +7,6 @@ class CommandClassifier:
     def __init__(self):
         # Initialize the model and tokenizer
         print("Loading Gemma-1b-it model...")
-        # self.model_name = "google/gemma-1b-it"
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        # self.model = AutoModelForCausalLM.from_pretrained(
-        #     self.model_name,
-        #     torch_dtype=torch.float16,
-        #     device_map="auto",
-        #     trust_remote_code=True
-        # )
         self.pipe = pipeline("text-generation", model="google/gemma-3-1b-it", device="cuda", torch_dtype=torch.bfloat16)
         
         # Initialize context
@@ -24,14 +16,14 @@ class CommandClassifier:
         self.prompt_template = """
 Instruction: You are a command classifier. Your task is to classify the following command and return a JSON object with the specified fields.
 
-Categories:
+Categories and their purposes:
 1. navigate - For navigating to websites (e.g., "go to youtube", "navigate to example.com")
 2. search - For searching on websites (e.g., "search for cats", "find videos about dogs")
-3. type - For typing text into input fields
-4. click - For clicking elements
-5. wait - For waiting
-6. scroll - For scrolling
-7. extract - For extracting information
+3. type - For typing text into input fields (e.g., "type username in the login field")
+4. click - For clicking elements (e.g., "click the submit button", "click on the first video")
+5. wait - For waiting (e.g., "wait for 5 seconds")
+6. scroll - For scrolling (e.g., "scroll down the page")
+7. extract - For extracting information (e.g., "extract all article titles")
 8. help - For showing help
 9. exit - For exiting
 
@@ -40,8 +32,18 @@ Return a JSON object with these fields:
     action: category_name,
     target: element_to_interact_with,
     value: text_to_type_or_search,
-    url: url_to_navigate_to
+    url: url_to_navigate_to,
+    element_type: type_of_element_to_find
 }
+
+The element_type field should be one of:
+- search_input: For search boxes
+- button: For buttons and submit elements
+- link: For clickable links
+- video: For video elements
+- form: For forms
+- input: For text input fields
+- null: When no specific element type is needed
 
 Examples:
 1. For "go to youtube", return:
@@ -49,7 +51,8 @@ Examples:
     action: navigate,
     target: youtube,
     value: null,
-    url: https://www.youtube.com
+    url: https://www.youtube.com,
+    element_type: null
 }
 
 2. For "search for cats on youtube", return:
@@ -57,15 +60,17 @@ Examples:
     action: search,
     target: youtube,
     value: cats,
-    url: https://www.youtube.com
+    url: https://www.youtube.com,
+    element_type: search_input
 }
 
-3. For "click the submit button", return:
+3. For "click the sign in button", return:
 {
     action: click,
-    target: submit button,
+    target: sign in button,
     value: null,
-    url: null
+    url: null,
+    element_type: button
 }
 
 4. For "type your name in the username field", return:
@@ -73,7 +78,8 @@ Examples:
     action: type,
     target: username,
     value: your name,
-    url: null
+    url: null,
+    element_type: input
 }
 
 5. For "wait for 5 seconds", return:
@@ -81,7 +87,8 @@ Examples:
     action: wait,
     target: null,
     value: 5,
-    url: null
+    url: null,
+    element_type: null
 }
 
 6. For "scroll down the page", return:
@@ -89,7 +96,17 @@ Examples:
     action: scroll,
     target: page,
     value: down,
-    url: null
+    url: null,
+    element_type: null
+}
+
+7. For "click on the first video", return:
+{
+    action: click,
+    target: first video,
+    value: null,
+    url: null,
+    element_type: video
 }
 """
     
@@ -101,7 +118,8 @@ Examples:
                 "action": None,
                 "target": None,
                 "value": None,
-                "url": None
+                "url": None,
+                "element_type": None
             }
             
             # Extract action from the first item
@@ -155,6 +173,19 @@ Examples:
                 # Use current URL for search if not specified
                 if result["action"] == "search" and not result["url"] and self.current_url:
                     result["url"] = self.current_url
+                
+                # Set element_type based on action and target
+                if result["action"] == "search":
+                    result["element_type"] = "search_input"
+                elif result["action"] == "click":
+                    if "video" in str(result["target"]).lower():
+                        result["element_type"] = "video"
+                    else:
+                        result["element_type"] = "button"
+                elif result["action"] == "type":
+                    result["element_type"] = "input"
+                else:
+                    result["element_type"] = None
             
             return result
             
@@ -164,7 +195,8 @@ Examples:
                 "action": None,
                 "target": None,
                 "value": None,
-                "url": None
+                "url": None,
+                "element_type": None
             }
     
     def classify_command(self, command: str) -> dict:
@@ -205,7 +237,8 @@ Examples:
                 "action": None,
                 "target": None,
                 "value": None,
-                "url": None
+                "url": None,
+                "element_type": None
             }
 
 # Test the command classifier
