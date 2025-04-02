@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
 import json
 import re
@@ -6,22 +6,27 @@ import re
 class CommandClassifier:
     def __init__(self):
         # Initialize the model and tokenizer
-        print("Loading Phi-1.5 model...")
-        self.model_name = "microsoft/phi-1_5"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True
-        )
+        print("Loading Gemma-1b-it model...")
+        # self.model_name = "google/gemma-1b-it"
+        # self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        # self.model = AutoModelForCausalLM.from_pretrained(
+        #     self.model_name,
+        #     torch_dtype=torch.float16,
+        #     device_map="auto",
+        #     trust_remote_code=True
+        # )
+        self.pipe = pipeline("text-generation", model="google/gemma-3-1b-it", device="cuda", torch_dtype=torch.bfloat16)
+        
+        # Initialize context
+        self.current_url = None
         
         # Define the classification prompt template
-        self.prompt_template = """Instruction: You are a command classifier. Your task is to classify the following command and return a JSON object with the specified fields.
+        self.prompt_template = """
+Instruction: You are a command classifier. Your task is to classify the following command and return a JSON object with the specified fields.
 
 Categories:
-1. navigate - For navigating to websites
-2. search - For searching on websites
+1. navigate - For navigating to websites (e.g., "go to youtube", "navigate to example.com")
+2. search - For searching on websites (e.g., "search for cats", "find videos about dogs")
 3. type - For typing text into input fields
 4. click - For clicking elements
 5. wait - For waiting
@@ -32,73 +37,129 @@ Categories:
 
 Return a JSON object with these fields:
 {
-    "action": "category_name",
-    "target": "element_to_interact_with",
-    "value": "text_to_type_or_search",
-    "url": "url_to_navigate_to"
+    action: category_name,
+    target: element_to_interact_with,
+    value: text_to_type_or_search,
+    url: url_to_navigate_to
 }
 
-For example, for the command "go to youtube and search for cats", return:
+Examples:
+1. For "go to youtube", return:
 {
-    "action": "search",
-    "target": "youtube",
-    "value": "cats",
-    "url": "https://www.youtube.com"
+    action: navigate,
+    target: youtube,
+    value: null,
+    url: https://www.youtube.com
 }
 
-Command to classify: {command}
+2. For "search for cats on youtube", return:
+{
+    action: search,
+    target: youtube,
+    value: cats,
+    url: https://www.youtube.com
+}
 
-Response: Let me classify that command into a JSON object:
+3. For "click the submit button", return:
+{
+    action: click,
+    target: submit button,
+    value: null,
+    url: null
+}
+
+4. For "type your name in the username field", return:
+{
+    action: type,
+    target: username,
+    value: your name,
+    url: null
+}
+
+5. For "wait for 5 seconds", return:
+{
+    action: wait,
+    target: null,
+    value: 5,
+    url: null
+}
+
+6. For "scroll down the page", return:
+{
+    action: scroll,
+    target: page,
+    value: down,
+    url: null
+}
 """
     
-    def clean_json_string(self, json_str: str) -> str:
-        """Clean the JSON string by removing any non-JSON content and fixing common issues."""
-        # Remove any text before the first {
-        json_str = json_str[json_str.find('{'):]
-        
-        # Remove any text after the last }
-        json_str = json_str[:json_str.rfind('}')+1]
-        
-        # Fix common JSON formatting issues
-        json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas
-        json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
-        json_str = re.sub(r'}\s*{', '},{', json_str)  # Fix multiple objects
-        
-        return json_str
-    
-    def extract_json_from_response(self, response: str) -> dict:
-        """Extract and parse JSON from the model response."""
+    def parse_list_to_dict(self, response_list: list) -> dict:
+        """Convert the list response to a dictionary with required fields."""
         try:
-            # Find all JSON objects in the response
-            json_matches = re.finditer(r'\{[^{}]*\}', response)
-            json_objects = []
+            # Initialize result with default values
+            result = {
+                "action": None,
+                "target": None,
+                "value": None,
+                "url": None
+            }
             
-            for match in json_matches:
-                try:
-                    json_str = self.clean_json_string(match.group(0))
-                    obj = json.loads(json_str)
-                    if isinstance(obj, dict) and "action" in obj:
-                        json_objects.append(obj)
-                except json.JSONDecodeError:
-                    continue
-            
-            if not json_objects:
-                raise ValueError("No valid JSON objects found in response")
-            
-            # Use the first valid JSON object
-            result = json_objects[0]
-            
-            # Ensure all required fields are present
-            required_fields = ["action", "target", "value", "url"]
-            for field in required_fields:
-                if field not in result:
-                    result[field] = None
+            # Extract action from the first item
+            if response_list and len(response_list) > 0:
+                first_item = response_list[0]
+                
+                # Extract JSON from markdown code block if present
+                json_match = re.search(r'```json\n(.*?)\n```', first_item, re.DOTALL)
+                if json_match:
+                    try:
+                        json_str = json_match.group(1)
+                        parsed_json = json.loads(json_str)
+                        result.update(parsed_json)
+                        
+                        # Update context if this is a navigation command
+                        if result["action"] == "navigate" and result["url"]:
+                            self.current_url = result["url"]
+                        # Use current URL for search if not specified
+                        elif result["action"] == "search" and not result["url"] and self.current_url:
+                            result["url"] = self.current_url
+                            
+                        return result
+                    except json.JSONDecodeError as e:
+                        print(f"Error parsing JSON: {e}")
+                        print(f"JSON string: {json_str}")
+                
+                # Fallback to regex parsing if no JSON found
+                action_match = re.search(r'action:\s*(\w+)', first_item)
+                if action_match:
+                    result["action"] = action_match.group(1)
+                
+                target_match = re.search(r'target:\s*([^,]+)', first_item)
+                if target_match:
+                    result["target"] = target_match.group(1).strip()
+                
+                value_match = re.search(r'value:\s*([^,]+)', first_item)
+                if value_match:
+                    result["value"] = value_match.group(1).strip()
+                
+                # Special handling for wait action
+                if result["action"] == "wait":
+                    duration_match = re.search(r'duration:\s*(\d+)\s*seconds', first_item)
+                    if duration_match:
+                        result["value"] = duration_match.group(1)
+                
+                # Special handling for scroll action
+                if result["action"] == "scroll":
+                    result["target"] = "page"
+                    result["value"] = "down"
+                
+                # Use current URL for search if not specified
+                if result["action"] == "search" and not result["url"] and self.current_url:
+                    result["url"] = self.current_url
             
             return result
             
         except Exception as e:
-            print(f"Error extracting JSON: {e}")
-            print(f"Raw response: {response}")
+            print(f"Error parsing list to dict: {e}")
             return {
                 "action": None,
                 "target": None,
@@ -108,31 +169,35 @@ Response: Let me classify that command into a JSON object:
     
     def classify_command(self, command: str) -> dict:
         """
-        Classify a natural language command using Phi-1.5
+        Classify a natural language command using Gemma-1b-it
         """
         try:
             # Prepare the prompt
-            prompt = self.prompt_template.format(command=command)
+            messages = [
+                [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": self.prompt_template},]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": command},]
+                    },
+                ],
+            ]
+            output = self.pipe(messages, max_new_tokens=500)
+            response = []
+
+            # Loop through the outer list and then the 'generated_text' list
+            for outer_item in output:
+                for item in outer_item:
+                    for entry in item['generated_text']:
+                        if entry['role'] == 'assistant':
+                            response.append(entry['content'])
             
-            # Tokenize the input
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            
-            # Generate response
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=256,
-                temperature=0.1,  # Low temperature for more deterministic output
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                repetition_penalty=1.2  # Add repetition penalty to avoid loops
-            )
-            
-            # Decode the response
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print(f"Raw response: {response}")  # Debug log
-            
-            # Extract and parse the JSON
-            return self.extract_json_from_response(response)
+            print(response)
+            # Parse the response list into a dictionary
+            return self.parse_list_to_dict(response)
                 
         except Exception as e:
             print(f"Error classifying command: {e}")
@@ -148,7 +213,6 @@ if __name__ == "__main__":
     classifier = CommandClassifier()
     test_commands = [
         "go to youtube and search for 3blue1brown",
-        "type your name in the username field",
         "click the submit button",
         "wait for 5 seconds",
         "scroll down the page"

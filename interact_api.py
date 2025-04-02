@@ -1,23 +1,11 @@
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.tag import pos_tag
-from nltk.chunk import ne_chunk
-from nltk.tree import Tree
 from typing import Dict, List, Tuple, Optional
 from playwright.sync_api import sync_playwright, Page
 import time
-import re
 import json
 from command_classifier import CommandClassifier
 
 class InteractAPI:
     def __init__(self):
-        # Download required NLTK data
-        nltk.download('punkt')
-        nltk.download('averaged_perceptron_tagger')
-        nltk.download('maxent_ne_chunker')
-        nltk.download('words')
-        
         # Initialize Playwright
         self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(headless=False)
@@ -29,46 +17,41 @@ class InteractAPI:
 
     def parse_command(self, command: str) -> Dict:
         """
-        Parse a natural language command using Gemini API
+        Parse a natural language command using the command classifier
         """
         return self.classifier.classify_command(command)
 
-    def extract_youtube_videos(self, limit: int = 3) -> List[Dict]:
+    def extract_page_content(self, selector: str, limit: int = 3) -> List[Dict]:
         """
-        Extract information about YouTube videos from search results
+        Extract information from any webpage using a CSS selector
         """
         try:
-            # Wait for video results to load
-            self.page.wait_for_selector("ytd-video-renderer", timeout=5000)
+            # Wait for elements to load
+            self.page.wait_for_selector(selector, timeout=5000)
             
-            # Extract video information using JavaScript
-            videos = self.page.evaluate("""
-                (limit) => {
-                    const videos = [];
-                    const items = document.querySelectorAll('ytd-video-renderer');
-                    for (let i = 0; i < Math.min(items.length, limit); i++) {
-                        const item = items[i];
-                        const titleElement = item.querySelector('#video-title');
-                        const channelElement = item.querySelector('#channel-name');
-                        const viewsElement = item.querySelector('#metadata-line');
-                        
-                        if (titleElement && channelElement) {
-                            videos.push({
-                                title: titleElement.textContent.trim(),
-                                url: titleElement.href,
-                                channel: channelElement.textContent.trim(),
-                                metadata: viewsElement ? viewsElement.textContent.trim() : ''
-                            });
-                        }
+            # Extract content using JavaScript
+            content = self.page.evaluate("""
+                (selector, limit) => {
+                    const items = [];
+                    const elements = document.querySelectorAll(selector);
+                    for (let i = 0; i < Math.min(elements.length, limit); i++) {
+                        const element = elements[i];
+                        items.push({
+                            text: element.textContent.trim(),
+                            href: element.href || null,
+                            attributes: Object.fromEntries(
+                                Array.from(element.attributes).map(attr => [attr.name, attr.value])
+                            )
+                        });
                     }
-                    return videos;
+                    return items;
                 }
-            """, limit)
+            """, selector, limit)
             
-            return videos
+            return content
             
         except Exception as e:
-            print(f"Error extracting videos: {str(e)}")
+            print(f"Error extracting content: {str(e)}")
             return []
 
     def execute_command(self, command: str) -> Tuple[bool, str]:
@@ -86,17 +69,49 @@ class InteractAPI:
             
             if parsed_command["action"] == "navigate":
                 if not parsed_command["url"]:
-                    # Default to YouTube if no URL specified
-                    self.page.goto("https://www.youtube.com")
-                    return True, "Navigated to YouTube"
+                    return False, "No URL provided for navigation"
                 self.page.goto(parsed_command["url"])
                 return True, f"Navigated to {parsed_command['url']}"
                 
             elif parsed_command["action"] == "click":
                 if not parsed_command["target"]:
                     return False, "No target element found for click action"
+                
+                # Wait for the page to load and stabilize
+                time.sleep(2)
+                
+                # Try different selectors for YouTube videos
+                if "youtube.com" in self.page.url:
+                    try:
+                        # Wait for video links to be visible
+                        self.page.wait_for_selector("a#video-title", timeout=10000)
+                        
+                        # Try to find and click the first video
+                        if "first" in parsed_command["target"].lower():
+                            try:
+                                # Click the first video link
+                                self.page.click("a#video-title")
+                                time.sleep(2)  # Wait for video to start loading
+                                return True, "Clicked the first video"
+                            except Exception as e:
+                                print(f"Error clicking first video: {e}")
+                        
+                        # Try to find video by title text
+                        try:
+                            # Find all video titles
+                            video_titles = self.page.query_selector_all("a#video-title")
+                            for title in video_titles:
+                                if title.is_visible():
+                                    title.click()
+                                    time.sleep(2)  # Wait for video to start loading
+                                    return True, "Clicked a video"
+                        except Exception as e:
+                            print(f"Error clicking video by title: {e}")
                     
-                # Try different selectors
+                    except Exception as e:
+                        print(f"Error with YouTube video selection: {e}")
+                
+                # Fallback to general click selectors
                 selectors = [
                     f"button:has-text('{parsed_command['target']}')",
                     f"a:has-text('{parsed_command['target']}')",
@@ -104,14 +119,21 @@ class InteractAPI:
                     f"[type='submit']",
                     f"button[type='submit']",
                     f"input[type='submit']",
-                    f"button"
+                    f"button",
+                    f"a[href*='{parsed_command['target'].lower()}']",
+                    f"a[title*='{parsed_command['target'].lower()}']"
                 ]
                 
                 for selector in selectors:
                     try:
+                        # Wait for element to be visible
+                        self.page.wait_for_selector(selector, timeout=5000)
+                        # Click the element
                         self.page.click(selector)
+                        time.sleep(1)  # Wait for click to register
                         return True, f"Clicked element: {parsed_command['target']}"
-                    except:
+                    except Exception as e:
+                        print(f"Error with selector {selector}: {e}")
                         continue
                         
                 return False, f"Could not find clickable element: {parsed_command['target']}"
@@ -152,44 +174,80 @@ class InteractAPI:
             elif parsed_command["action"] == "search":
                 if not parsed_command["value"]:
                     return False, "No search query provided"
+                
+                # First navigate to the URL if provided and we're not already there
+                if parsed_command.get("url"):
+                    current_url = self.page.url
+                    if not current_url.startswith(parsed_command["url"]):
+                        self.page.goto(parsed_command["url"])
+                        time.sleep(3)  # Wait longer for page to load
                     
-                # Try to find and fill YouTube search box
+                # Try to find and fill search box
                 try:
-                    # First try YouTube-specific search box
-                    try:
-                        self.page.fill("#search-input input", parsed_command["value"])
-                    except:
-                        self.page.fill("input[name='search_query']", parsed_command["value"])
+                    # YouTube-specific selectors first
+                    if parsed_command.get("url") and "youtube.com" in parsed_command["url"]:
+                        # Wait for the search box to be visible
+                        try:
+                            self.page.wait_for_selector("input[name='search_query']", timeout=10000)
+                            # Clear any existing text
+                            self.page.fill("input[name='search_query']", "")
+                            # Type the search query
+                            self.page.fill("input[name='search_query']", parsed_command["value"])
+                            # Press Enter to search
+                            self.page.keyboard.press("Enter")
+                            time.sleep(3)  # Wait longer for results
+                            return True, f"Searched for '{parsed_command['value']}'"
+                        except Exception as e:
+                            print(f"Error with YouTube search: {e}")
                     
-                    # Press Enter to search
-                    self.page.keyboard.press("Enter")
+                    # Fallback to common search selectors
+                    search_selectors = [
+                        "input[type='search']",
+                        "input[name='q']",
+                        "input[name='search']",
+                        "input[aria-label='Search']",
+                        "input[placeholder*='search']",
+                        "input[placeholder*='Search']",
+                        "input[name='search_query']",
+                        "#search-input input",
+                        "input#search"
+                    ]
                     
-                    # Wait for results and extract videos
-                    print("Waiting for search results to load...")
-                    self.page.wait_for_selector("ytd-video-renderer", timeout=10000)  # Wait up to 10 seconds
-                    time.sleep(2)  # Additional wait for dynamic content
-                    videos = self.extract_youtube_videos(3)
+                    for selector in search_selectors:
+                        try:
+                            # Wait for the search input to be visible
+                            self.page.wait_for_selector(selector, timeout=5000)
+                            # Clear any existing text
+                            self.page.fill(selector, "")
+                            # Type the search query
+                            self.page.fill(selector, parsed_command["value"])
+                            # Press Enter to search
+                            self.page.keyboard.press("Enter")
+                            time.sleep(3)  # Wait longer for results
+                            return True, f"Searched for '{parsed_command['value']}'"
+                        except Exception as e:
+                            print(f"Error with selector {selector}: {e}")
+                            continue
                     
-                    if videos:
-                        # Save results to a file
-                        with open("youtube_results.json", "w") as f:
-                            json.dump(videos, f, indent=2)
-                        return True, f"Found {len(videos)} videos and saved to youtube_results.json"
-                    else:
-                        return False, "No videos found in search results"
+                    return False, "Could not find search input field"
                         
                 except Exception as e:
                     return False, f"Error performing search: {str(e)}"
             
             elif parsed_command["action"] == "extract":
-                if parsed_command["target"] == "video":
-                    videos = self.extract_youtube_videos(3)
-                    if videos:
-                        with open("youtube_results.json", "w") as f:
-                            json.dump(videos, f, indent=2)
-                        return True, f"Extracted {len(videos)} videos and saved to youtube_results.json"
-                    else:
-                        return False, "No videos found to extract"
+                if not parsed_command["target"]:
+                    return False, "No target specified for extraction"
+                
+                # Extract content based on target
+                content = self.extract_page_content(parsed_command["target"])
+                if content:
+                    # Save results to a file
+                    filename = f"extracted_{parsed_command['target'].replace(' ', '_')}.json"
+                    with open(filename, "w") as f:
+                        json.dump(content, f, indent=2)
+                    return True, f"Extracted {len(content)} items and saved to {filename}"
+                else:
+                    return False, f"No content found for selector: {parsed_command['target']}"
             
             return False, f"Unsupported action: {parsed_command['action']}"
                     
