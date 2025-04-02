@@ -2,6 +2,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
 import json
 import re
+from typing import Dict, Tuple
 
 class CommandClassifier:
     def __init__(self):
@@ -198,7 +199,25 @@ Examples:
                 "url": None,
                 "element_type": None
             }
-    
+
+    def validate_command(self, parsed_command: Dict) -> Tuple[bool, str]:
+        """
+        Validate the parsed command and return (is_valid, error_message)
+        """
+        if not parsed_command["action"]:
+            return False, "No valid action found in command"
+            
+        if parsed_command["action"] in ["click", "type"] and not parsed_command["target"]:
+            return False, f"Command requires a target element for action: {parsed_command['action']}"
+            
+        if parsed_command["action"] == "type" and not parsed_command["value"]:
+            return False, "Type command requires text to enter"
+            
+        if parsed_command["action"] == "navigate" and not parsed_command["url"]:
+            return False, "Navigate command requires a URL"
+            
+        return True, ""
+
     def classify_command(self, command: str) -> dict:
         """
         Classify a natural language command using Gemma-1b-it
@@ -229,7 +248,8 @@ Examples:
             
             print(response)
             # Parse the response list into a dictionary
-            return self.parse_list_to_dict(response)
+            parsed_command = self.parse_list_to_dict(response)
+            return parsed_command
                 
         except Exception as e:
             print(f"Error classifying command: {e}")
